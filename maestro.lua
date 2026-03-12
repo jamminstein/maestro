@@ -70,6 +70,7 @@ local global_step = 0
 
 local alt        = false
 local grid_dirty = true
+local main_lattice = nil
 
 -- ─────────────────────────────────────────────────────────
 -- VOICE TABLE
@@ -878,7 +879,7 @@ function init()
   rebuild_scale()
   current_chord_degrees = get_mode_progression()[chord_idx]
 
-  local main_lattice = lattice:new({ auto=true, meter=4, ppqn=96 })
+  main_lattice = lattice:new({ auto=true, meter=4, ppqn=96 })
   main_lattice:new_sprocket({
     action = step_tick, division = 1/16, enabled = true,
   })
@@ -1026,13 +1027,22 @@ end
 -- CLEANUP
 -- ─────────────────────────────────────────────────────────
 function cleanup()
+  playing = false
   -- BUG FIX #4: explicitly noteOff all held internal (MollyThePoly) notes
-  -- engine.noteOffAll() is not a valid MollyThePoly command
   internal_notes_off()
   all_notes_off()
-  -- Polite exit: zero expression CC on all MIDI devices
+  -- Destroy lattice
+  if main_lattice then main_lattice:destroy() end
+  -- Cancel all clock coroutines (grid redraw, deferred engine setup, etc.)
+  clock.cancel_all()
+  -- MIDI panic: all notes off + zero expression on all devices
   for _, dn in ipairs{"op1","opz","opxy"} do
     local device = dev[dn]
-    if device then device:cc(cc_nums[dn].expr, 0, 1) end
+    if device then
+      for ch = 1, 16 do
+        device:cc(123, 0, ch)
+      end
+      device:cc(cc_nums[dn].expr, 0, 1)
+    end
   end
 end
