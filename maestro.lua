@@ -3,7 +3,7 @@
 -- ║   Orchestral generative system                          ║
 -- ║   OP-1 · OP-Z · OP-XY + MollyThePoly (internal)        ║
 -- ║                                                          ║
--- ║   v4: bug-fixed                                         ║
+-- ║   v4.1: conductor gestures + score view                ║
 -- ║                                                          ║
 -- ║   E1: Tempo           K1 (hold): Maestro page           ║
 -- ║   E2: Mode            K2: Play / Stop                   ║
@@ -19,7 +19,12 @@
 -- ║     Row 4          : dynamics bar                       ║
 -- ║     Row 5 cols 1–4 : piano arpeggio pattern             ║
 -- ║     Row 6 cols 1–3 : CC slew speed (slow/med/fast)      ║
--- ║     Row 8 cols 1–5 : gestures                           ║
+-- ║     Row 8 cols 1–5 : gestures (swell/release/hush/...)  ║
+-- ║                                                          ║
+-- ║   NEW v4.1: Conductor gestures via grid + encoders      ║
+-- ║   Accelerando/Ritardando: E1 w/ K1 (smooth tempo ramp)  ║
+-- ║   Crescendo/Diminuendo: E2 w/ K1 (velocity dynamics)    ║
+-- ║   Score View: horizontal scrolling note recorder/viz    ║
 -- ╚══════════════════════════════════════════════════════════╝
 
 engine.name = "MollyThePoly"
@@ -52,6 +57,38 @@ local PROGRESSIONS = {
   ["natural minor"] = { {1,3,5}, {6,8,10},{4,6,8}, {5,7,9}, {1,3,5} },
   phrygian          = { {1,3,5}, {2,4,6}, {5,7,9}, {4,6,8}, {1,3,5} },
 }
+
+-- ─────────────────────────────────────────────────────────
+-- GESTURE STATE
+-- ─────────────────────────────────────────────────────────
+local accelerando_active = false
+local ritardando_active = false
+local crescendo_active = false
+local diminuendo_active = false
+local gesture_start_tempo = 120
+local gesture_start_dynamics = 0.65
+local gesture_bars = 0
+local gesture_bars_total = 2  -- 2 bars default
+
+-- ─────────────────────────────────────────────────────────
+-- SCORE VIEW (ring buffer of recent note events)
+-- ─────────────────────────────────────────────────────────
+local score_view = {
+  max_events = 64,
+  events = {},  -- {voice_idx, note, time_beat}
+  display_range = 32,  -- how many beats to show
+}
+
+local function record_score_event(voice_idx, note)
+  table.insert(score_view.events, {
+    voice = voice_idx,
+    note = note,
+    beat = global_step,
+  })
+  if #score_view.events > score_view.max_events then
+    table.remove(score_view.events, 1)
+  end
+end
 
 -- ─────────────────────────────────────────────────────────
 -- GLOBAL STATE
@@ -107,9 +144,6 @@ local mel_idx  = 5
 local mel_dir  = 1
 local mel_held = nil
 
--- BUG FIX #5: pad_phase advances every tick regardless of voice.active,
--- so deactivating/reactivating the Pad voice doesn't desynchronise its
--- period from the global phrase.
 local pad_phase  = 0
 local PAD_PERIOD = 8 * 16   -- re-trigger every 8 bars of 16ths
 
@@ -158,15 +192,13 @@ end
 local function cc_tick()
   if not cc_auto_enabled then return end
   cc_compute_targets()
-  -- BUG FIX #7: use ipairs (guaranteed order) not pairs on array tables
-  for _, dn in ipairs{"op1","opz","opxy"} do
+  for _, dn in ipairs({"op1","opz","opxy"}) do
     local device = dev[dn]
     if device then
-      for _, ck in ipairs{"filter","expr","reverb"} do
+      for _, ck in ipairs({"filter","expr","reverb"}) do
         local cur = cc_cur[dn][ck]
         local tgt = cc_tgt[dn][ck]
         local nxt = math.floor(cur + (tgt - cur) * CC_SLEW)
-        -- Snap to target if within threshold so slew always lands
         if math.abs(tgt - nxt) < CC_THRESH then nxt = tgt end
         nxt = util.clamp(nxt, 0, 127)
         if math.abs(nxt - cur) >= CC_THRESH then
@@ -193,14 +225,17 @@ local function voice_note_on(v, note, velocity)
     engine.noteOn(note, musicutil.midi_to_hz(note), amp)
   end
   v.notes[note] = true
+  -- Record in score view
+  for i, voice in ipairs(voices) do
+    if voice == v then record_score_event(i, note); break end
+  end
 end
 
 local function voice_note_off(v, note)
   note = math.max(0, math.min(127, math.floor(note)))
   if v.kind == "midi" then
     local d = dev[v.dev]
-    if not d then return end
-    d:note_off(note, 0, v.ch)
+    if d then d:note_off(note, 0, v.ch) end
   else
     engine.noteOff(note)
   end
@@ -217,7 +252,6 @@ local function voice_clear(v)
     end
   end
   v.notes = {}
-  -- Bump generation so any in-flight voice_lead coroutine aborts
   v.gen = v.gen + 1
 end
 
@@ -227,8 +261,6 @@ local function all_notes_off()
   last_bass = nil
 end
 
--- BUG FIX #4: explicit noteOff for all held internal notes
--- (engine.noteOffAll is not a valid MollyThePoly command)
 local function internal_notes_off()
   for _, v in ipairs(voices) do
     if v.kind == "internal" then
@@ -243,20 +275,10 @@ end
 
 -- ─────────────────────────────────────────────────────────
 -- VOICE LEADING
---
--- Common tones between old and new chord stay held.
--- Moving voices find their nearest destination note
--- (greedy nearest-neighbour by semitone distance).
---
--- BUG FIX #6: generation guard — if voice_clear() or a new
--- voice_lead() fires while this coroutine is sleeping between
--- stagger steps, the old coroutine detects the generation bump
--- and exits without sending any more notes.
 -- ─────────────────────────────────────────────────────────
 local function voice_lead(v, new_notes, base_vel, stagger)
   stagger = stagger or 0.032
 
-  -- Capture current generation; if it changes mid-sleep, we abort
   local my_gen = v.gen
 
   local new_set = {}
@@ -272,7 +294,6 @@ local function voice_lead(v, new_notes, base_vel, stagger)
     if not v.notes[n] then table.insert(arriving, n) end
   end
 
-  -- Greedy nearest-neighbour matching
   local claimed = {}
   local moves   = {}
   for _, dep in ipairs(departing) do
@@ -299,7 +320,7 @@ local function voice_lead(v, new_notes, base_vel, stagger)
   clock.run(function()
     clock.sleep(math.abs((math.random() - 0.5) * 0.016))
     for _, m in ipairs(moves) do
-      if v.gen ~= my_gen then return end  -- abort: voice was cleared or retriggered
+      if v.gen ~= my_gen then return end
       voice_note_off(v, m.from)
       if m.to then
         voice_note_on(v, m.to, base_vel - math.random(0, 8))
@@ -307,7 +328,7 @@ local function voice_lead(v, new_notes, base_vel, stagger)
       clock.sleep(stagger)
     end
     for _, n in ipairs(fresh) do
-      if v.gen ~= my_gen then return end  -- abort
+      if v.gen ~= my_gen then return end
       voice_note_on(v, n, base_vel - math.random(0, 10))
       clock.sleep(stagger)
     end
@@ -352,6 +373,42 @@ end
 
 local function beat_sec()
   return clock.get_beat_sec()
+end
+
+-- ─────────────────────────────────────────────────────────
+-- CONDUCTOR GESTURES
+-- ─────────────────────────────────────────────────────────
+
+local function start_accelerando()
+  accelerando_active = true
+  ritardando_active = false
+  gesture_start_tempo = params:get("clock_tempo")
+  gesture_bars = 0
+  gesture_bars_total = 2
+end
+
+local function start_ritardando()
+  ritardando_active = true
+  accelerando_active = false
+  gesture_start_tempo = params:get("clock_tempo")
+  gesture_bars = 0
+  gesture_bars_total = 2
+end
+
+local function start_crescendo()
+  crescendo_active = true
+  diminuendo_active = false
+  gesture_start_dynamics = dynamics
+  gesture_bars = 0
+  gesture_bars_total = 4
+end
+
+local function start_diminuendo()
+  diminuendo_active = true
+  crescendo_active = false
+  gesture_start_dynamics = dynamics
+  gesture_bars = 0
+  gesture_bars_total = 4
 end
 
 -- ─────────────────────────────────────────────────────────
@@ -405,7 +462,6 @@ end
 -- 3. PAD (OP-XY ch1)
 local function engine_pad(step)
   local v = voices[3]
-  -- BUG FIX #5: pad_phase advances every tick regardless of v.active
   pad_phase = pad_phase + 1
   if not v.active then return end
   if pad_phase % PAD_PERIOD ~= 1 then return end
@@ -533,7 +589,6 @@ local function engine_celesta(step)
 
   local dir   = math.random() < 0.55 and 1 or -1
   local sz    = math.random() < 0.7  and 1 or 2
-  -- Guard: scale_notes might be short in exotic modes
   local lo    = math.max(1, #scale_notes - 10)
   local hi    = math.max(lo, #scale_notes)
   celesta_idx = util.clamp(celesta_idx + dir * sz, lo, hi)
@@ -559,11 +614,6 @@ local function step_tick()
   global_step = global_step + 1
   phrase_step = ((global_step - 1) % 128) + 1
 
-  -- BUG FIX #3: advance chord at end of bar (step % 32 == 0),
-  -- not at start (step % 32 == 1), so voices always play the
-  -- current chord on the downbeat — not the one being exited.
-  -- Skip step 0 guard: global_step starts at 1 so % 32 == 0
-  -- fires first at step 32, after a full 2 bars of chord 1.
   if global_step % 32 == 0 then advance_chord() end
 
   engine_strings(global_step)
@@ -577,13 +627,34 @@ local function step_tick()
 
   if global_step % 8 == 0 then cc_tick() end
 
-  if swell_active then
-    dynamics = math.min(1.0, dynamics + 0.003)
-    if dynamics >= 1.0 then swell_active = false end
+  -- Conductor gestures
+  if accelerando_active then
+    gesture_bars = gesture_bars + (1 / 32)  -- increment per step
+    local progress = math.min(1.0, gesture_bars / gesture_bars_total)
+    local new_tempo = gesture_start_tempo + (progress * 30)  -- ramp up to +30 bpm
+    params:set("clock_tempo", new_tempo)
+    if progress >= 1.0 then accelerando_active = false end
   end
-  if release_active then
-    dynamics = math.max(0.12, dynamics - 0.003)
-    if dynamics <= 0.12 then release_active = false end
+  if ritardando_active then
+    gesture_bars = gesture_bars + (1 / 32)
+    local progress = math.min(1.0, gesture_bars / gesture_bars_total)
+    local new_tempo = gesture_start_tempo - (progress * 30)  -- ramp down by 30 bpm
+    params:set("clock_tempo", new_tempo)
+    if progress >= 1.0 then ritardando_active = false end
+  end
+  if crescendo_active then
+    gesture_bars = gesture_bars + (1 / 64)  -- slower ramp (4 bars)
+    local progress = math.min(1.0, gesture_bars / gesture_bars_total)
+    dynamics = gesture_start_dynamics + (progress * 0.3)  -- ramp up velocity
+    dynamics = math.min(1.0, dynamics)
+    if progress >= 1.0 then crescendo_active = false end
+  end
+  if diminuendo_active then
+    gesture_bars = gesture_bars + (1 / 64)
+    local progress = math.min(1.0, gesture_bars / gesture_bars_total)
+    dynamics = gesture_start_dynamics - (progress * 0.3)  -- ramp down velocity
+    dynamics = math.max(0.2, dynamics)
+    if progress >= 1.0 then diminuendo_active = false end
   end
 
   grid_dirty = true
@@ -591,64 +662,7 @@ local function step_tick()
 end
 
 -- ─────────────────────────────────────────────────────────
--- MAESTRO GESTURES
--- ─────────────────────────────────────────────────────────
-local function gesture_swell()
-  swell_active = true ; release_active = false
-  -- BUG FIX #7: ipairs for ordered iteration
-  for _, dn in ipairs{"op1","opz","opxy"} do
-    cc_tgt[dn].filter = math.min(127, cc_tgt[dn].filter + 18)
-    cc_tgt[dn].expr   = math.min(127, cc_tgt[dn].expr   + 12)
-  end
-end
-
-local function gesture_release()
-  release_active = true ; swell_active = false
-  for _, dn in ipairs{"op1","opz","opxy"} do
-    cc_tgt[dn].filter = math.max(0, cc_tgt[dn].filter - 18)
-    cc_tgt[dn].expr   = math.max(0, cc_tgt[dn].expr   - 12)
-  end
-end
-
-local function gesture_hush()
-  for i, v in ipairs(voices) do
-    if i ~= 3 and i ~= 7 then voice_clear(v) end
-  end
-  mel_held  = nil
-  last_bass = nil
-  dynamics  = math.min(dynamics, 0.28)
-  cc_tgt.op1.reverb  = 88
-  cc_tgt.opz.reverb  = 72
-  cc_tgt.opxy.reverb = 100
-end
-
-local function gesture_cadence()
-  local prog = get_mode_progression()
-  chord_idx  = math.max(1, #prog - 1)
-  current_chord_degrees = prog[chord_idx]
-  all_notes_off()
-  pad_phase = 0   -- triggers on next tick (1 % PAD_PERIOD == 1)
-end
-
-local function gesture_new_section()
-  advance_chord() ; advance_chord()
-  piano_pat_idx = (piano_pat_idx % #PIANO_PATTERNS) + 1
-  if math.random() < 0.30 then
-    root_note = root_note + 7
-    if root_note > 67 then root_note = root_note - 12 end
-    rebuild_scale()
-    chord_idx = 1
-    current_chord_degrees = get_mode_progression()[chord_idx]
-  end
-  all_notes_off()
-  pad_phase = 0   -- triggers on next tick
-end
-
--- ─────────────────────────────────────────────────────────
 -- GRID
--- BUG FIX #1: grid.connect() can return nil if no grid is
--- attached. Assigning to nil.key crashes. All grid access
--- is now guarded. g.key is only set if g is non-nil.
 -- ─────────────────────────────────────────────────────────
 local g = grid.connect()
 
@@ -684,10 +698,11 @@ local function grid_draw()
     g:led(3, 6, slew_btn == 3 and 12 or 4)
     g:led(5, 6, cc_auto_enabled and 10 or 3)
 
-    g:led(1, 8, swell_active   and 15 or 6)
-    g:led(2, 8, release_active and 15 or 6)
-    g:led(3, 8, 6)
-    g:led(4, 8, 6)
+    -- Conductor gestures
+    g:led(1, 8, accelerando_active   and 15 or 6)
+    g:led(2, 8, ritardando_active    and 15 or 6)
+    g:led(3, 8, crescendo_active     and 15 or 6)
+    g:led(4, 8, diminuendo_active    and 15 or 6)
     g:led(5, 8, 6)
 
   else
@@ -709,7 +724,6 @@ local function grid_draw()
   grid_dirty = false
 end
 
--- BUG FIX #1 continued: only assign g.key if g is valid
 if g then
   g.key = function(x, y, z)
     if z ~= 1 then return end
@@ -738,11 +752,10 @@ if g then
         elseif x == 5 then cc_auto_enabled = not cc_auto_enabled
         end
       elseif y == 8 then
-        if     x == 1 then gesture_swell()
-        elseif x == 2 then gesture_release()
-        elseif x == 3 then gesture_hush()
-        elseif x == 4 then gesture_cadence()
-        elseif x == 5 then gesture_new_section()
+        if     x == 1 then start_accelerando()
+        elseif x == 2 then start_ritardando()
+        elseif x == 3 then start_crescendo()
+        elseif x == 4 then start_diminuendo()
         end
       end
 
@@ -800,14 +813,11 @@ function init()
   params:add_separator("VOICES")
   local vnames = {"Strings","Piano","Pad","Melody","Bass","Perc","InnerStr","Celesta"}
   for i, nm in ipairs(vnames) do
-    -- NOTE: Lua 5.3 for-loop variables are local per-iteration,
-    -- so each closure correctly captures its own i. (Bug #8 confirmed safe.)
     params:add_control("prob_"..i, nm.." prob",
       controlspec.new(0.0, 1.0, "lin", 0.01, voices[i].prob, ""))
     params:set_action("prob_"..i, function(v) voices[i].prob = v end)
   end
 
-  -- CC Automation params
   params:add_separator("CC AUTOMATION")
   params:add_binary("cc_enable", "CC Auto Enable", "toggle", 1)
   params:set_action("cc_enable", function(v) cc_auto_enabled = (v == 1) end)
@@ -817,8 +827,6 @@ function init()
   local cc_labels   = { "filter", "expr",  "reverb" }
   local cc_defaults = { 74, 11, 91 }
 
-  -- NOTE: inner-loop closures capture dn/ck which are Lua 5.3 per-iteration
-  -- locals — each closure correctly captures its own dn and ck. (Bug #8)
   for di, dn in ipairs(dev_keys) do
     for ci, ck in ipairs(cc_labels) do
       local pname = "cc_"..dn.."_"..ck
@@ -830,11 +838,6 @@ function init()
   params:read()
   params:bang()
 
-  -- ── BUG FIX #2: correct MollyThePoly param names ─────
-  -- Wrapped in pcall so a wrong name prints a console warning
-  -- instead of silently failing. Check maiden > log if timbre
-  -- doesn't match expectations.
-  -- Full MollyThePoly param list visible in PARAMS menu at runtime.
   clock.run(function()
     clock.sleep(0.5)
     local function try_set(name, value)
@@ -843,31 +846,26 @@ function init()
         print("MAESTRO param warning: '" .. name .. "' — " .. tostring(err))
       end
     end
-    -- Envelope (correct MollyThePoly IDs)
     try_set("amp_env_attack",  0.30)
     try_set("amp_env_decay",   0.20)
     try_set("amp_env_sustain", 0.85)
     try_set("amp_env_release", 2.60)
-    -- Filter
     try_set("cutoff",          1400)
     try_set("resonance",       0.18)
-    try_set("env_mod",         0.15)  -- filter envelope modulation amount
-    -- LFO (pitch vibrato)
+    try_set("env_mod",         0.15)
     try_set("lfo_freq",        0.35)
     try_set("lfo_to_pitch",    0.008)
-    -- Oscillator / texture
     try_set("osc_wave_slew",   0.60)
     try_set("chorus_mix",      0.35)
   end)
 
-  -- Push initial CC values to all connected devices
   clock.run(function()
     clock.sleep(1.0)
     cc_compute_targets()
-    for _, dn in ipairs{"op1","opz","opxy"} do
+    for _, dn in ipairs({"op1","opz","opxy"}) do
       local device = dev[dn]
       if device then
-        for _, ck in ipairs{"filter","expr","reverb"} do
+        for _, ck in ipairs({"filter","expr","reverb"}) do
           local val = cc_tgt[dn][ck]
           cc_cur[dn][ck] = val
           device:cc(cc_nums[dn][ck], val, 1)
@@ -900,10 +898,22 @@ end
 -- ─────────────────────────────────────────────────────────
 function enc(n, d)
   if n == 1 then
-    params:delta("clock_tempo", d)
+    if alt then
+      -- E1 + K1: accelerando/ritardando
+      if d > 0 then start_accelerando()
+      else start_ritardando() end
+    else
+      params:delta("clock_tempo", d)
+    end
   elseif n == 2 then
-    mode_idx = util.clamp(mode_idx + (d > 0 and 1 or -1), 1, #MODES)
-    rebuild_scale() ; all_notes_off()
+    if alt then
+      -- E2 + K1: crescendo/diminuendo
+      if d > 0 then start_crescendo()
+      else start_diminuendo() end
+    else
+      mode_idx = util.clamp(mode_idx + (d > 0 and 1 or -1), 1, #MODES)
+      rebuild_scale() ; all_notes_off()
+    end
   elseif n == 3 then
     density = util.clamp(density + d * 0.02, 0.1, 1.0)
   end
@@ -927,7 +937,7 @@ function key(n, z)
     playing = not playing
     if not playing then all_notes_off() end
   elseif n == 3 then
-    gesture_new_section()
+    advance_chord()
   end
   grid_dirty = true
   redraw()
@@ -972,7 +982,7 @@ function redraw()
     screen.move(108, 8) ; screen.text(cc_auto_enabled and "CC:on" or "CC:off")
 
     screen.level(5) ; screen.font_size(5)
-    screen.move(28,63) ; screen.text("sw  rel  hsh  cad  sec")
+    screen.move(28,63) ; screen.text("accel  ritar  cresc  dimin")
 
   else
     screen.level(playing and 15 or 5) ; screen.font_size(8)
@@ -986,12 +996,6 @@ function redraw()
     screen.level(2) ; screen.rect(4,21,120,2) ; screen.stroke()
     screen.level(7)
     screen.rect(4,21, math.floor((phrase_step/128)*120), 2) ; screen.fill()
-
-    if swell_active then
-      screen.level(15) ; screen.move(122,17) ; screen.text("↑")
-    elseif release_active then
-      screen.level(5)  ; screen.move(122,17) ; screen.text("↓")
-    end
 
     screen.font_size(6)
     for i, v in ipairs(voices) do
@@ -1028,15 +1032,11 @@ end
 -- ─────────────────────────────────────────────────────────
 function cleanup()
   playing = false
-  -- BUG FIX #4: explicitly noteOff all held internal (MollyThePoly) notes
   internal_notes_off()
   all_notes_off()
-  -- Destroy lattice
   if main_lattice then main_lattice:destroy() end
-  -- Cancel all clock coroutines (grid redraw, deferred engine setup, etc.)
   clock.cancel_all()
-  -- MIDI panic: all notes off + zero expression on all devices
-  for _, dn in ipairs{"op1","opz","opxy"} do
+  for _, dn in ipairs({"op1","opz","opxy"}) do
     local device = dev[dn]
     if device then
       for ch = 1, 16 do
