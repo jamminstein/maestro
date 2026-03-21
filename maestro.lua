@@ -753,6 +753,7 @@ end
 local g = grid.connect()
 
 local function grid_draw()
+  if not g.device then return end
   if not g then return end
   g:all(0)
 
