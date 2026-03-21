@@ -669,6 +669,12 @@ end
 local function step_tick()
   if not playing then return end
 
+  -- Fermata — skip engine calls if K3 held
+  if fermata_active then
+    -- Don't advance sequencer; voices sustain
+    return
+  end
+
   global_step = global_step + 1
   phrase_step = ((global_step - 1) % 128) + 1
   beat_phase = (beat_phase + 1/16) % 1  -- update beat phase
@@ -725,11 +731,6 @@ local function step_tick()
     gesture_flash_time = gesture_flash_time - (1/15)  -- ~15fps for decay
   end
 
-  -- NEW: Fermata — skip engine calls if K3 held
-  if fermata_active then
-    -- Don't advance sequencer; voices sustain
-    return
-  end
 
   -- NEW: Check rehearsal marks at bar boundaries
   local current_bar = math.floor(global_step / 96)  -- 96 steps per bar (16 * 6)
