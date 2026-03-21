@@ -259,7 +259,7 @@ local function voice_note_on(v, note, velocity)
     d:note_on(note, velocity, v.ch)
   else
     local amp = math.max(0.01, math.min(1.0, velocity / 127.0))
-    engine.noteOn(note, musicutil.midi_to_hz(note), amp)
+    engine.noteOn(note, musicutil.note_num_to_freq(note), amp)
   end
   v.notes[note] = true
   -- Update voice activity
