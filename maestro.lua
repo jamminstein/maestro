@@ -125,6 +125,7 @@ local global_step = 0
 local alt        = false
 local grid_dirty = true
 local main_lattice = nil
+local screen_clock_id = nil
 
 -- ─────────────────────────────────────────────────────────
 -- NEW: DYNAMICS MODE, TUTTI/SOLI, FERMATA, REHEARSAL MARKS
@@ -987,7 +988,7 @@ function init()
   })
   main_lattice:start()
 
-  clock.run(function()
+  screen_clock_id = clock.run(function()
     while true do
       clock.sleep(1/15)  -- 15fps refresh for score view scrolling
       if grid_dirty then grid_draw() end
@@ -1281,7 +1282,8 @@ function cleanup()
   internal_notes_off()
   all_notes_off()
   if main_lattice then main_lattice:destroy() end
-  clock.cancel_all()
+  if screen_clock_id then clock.cancel(screen_clock_id) end
+  engine.noteKillAll()
   for _, dn in ipairs({"op1","opz","opxy"}) do
     local device = dev[dn]
     if device then
