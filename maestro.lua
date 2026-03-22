@@ -1098,7 +1098,7 @@ end
 -- ─────────────────────────────────────────────────────────
 function redraw()
   screen.clear()
-  screen.aa(1)
+  screen.aa(0)
 
   if alt then
     -- MAESTRO EDIT PAGE (unchanged)
